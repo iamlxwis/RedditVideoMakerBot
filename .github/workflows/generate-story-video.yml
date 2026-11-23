@@ -1,0 +1,52 @@
+name: Generate Story Video
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "sample (free), manual, ai (Gemini key), reddit (requires approved API integration)"
+        type: choice
+        options: [sample, manual, ai, reddit]
+        default: sample
+      story_text:
+        description: "Story text (manual mode only; visible in workflow metadata)"
+        required: false
+        type: string
+      topic:
+        description: "AI story topic"
+        required: false
+        default: "An unexpected act of kindness"
+        type: string
+permissions:
+  contents: read
+jobs:
+  video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install minimal video dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
+          python -m pip install --disable-pip-version-check 'gTTS==2.5.4' 'Pillow==11.2.1'
+      - name: Generate video
+        env:
+          SOURCE: ${{ inputs.source }}
+          STORY_TEXT: ${{ inputs.story_text }}
+          TOPIC: ${{ inputs.topic }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python cloud_video/generate.py --source "$SOURCE" --text "$STORY_TEXT" --topic "$TOPIC"
+      - name: Upload finished MP4
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: story-video
+          path: |
+            generated/story-video.mp4
+            generated/story.txt
+          if-no-files-found: error
+          retention-days: 7
