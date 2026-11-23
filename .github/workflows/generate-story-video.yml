@@ -3,46 +3,73 @@ on:
   workflow_dispatch:
     inputs:
       source:
-        description: "sample (free), manual, ai (Gemini key), reddit (requires approved API integration)"
+        description: Story source (Reddit requires separate approved API access)
         type: choice
-        options: [sample, manual, ai, reddit]
+        options: [sample, manual, ai]
         default: sample
       story_text:
-        description: "Story text (manual mode only; visible in workflow metadata)"
-        required: false
+        description: Manual story text (visible in workflow metadata; do not use secrets)
         type: string
+        required: false
       topic:
-        description: "AI story topic"
-        required: false
-        default: "An unexpected act of kindness"
+        description: AI story topic
         type: string
+        default: An unexpected act of kindness
+      background:
+        description: Random selects from licensed videos in assets/backgrounds/video
+        type: choice
+        options: [random, minecraft, minecraft-2, gta]
+        default: random
+      layout:
+        description: Video layout
+        type: choice
+        options: [full, split]
+        default: full
+      voice:
+        description: Narration voice
+        type: choice
+        options: [guy, jenny, ryan, sonia]
+        default: guy
+      captions:
+        description: Caption style
+        type: choice
+        options: [highlight, normal, none]
+        default: highlight
+      rate:
+        description: Narration speed adjustment percent (-40 to 40)
+        type: string
+        default: '0'
 permissions:
   contents: read
 jobs:
   video:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install minimal video dependencies
+      - name: Install renderer dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg fonts-dejavu-core
-          python -m pip install --disable-pip-version-check 'gTTS==2.5.4' 'Pillow==11.2.1'
-      - name: Generate video
+          python -m pip install --disable-pip-version-check 'edge-tts==7.2.7'
+      - name: Render story video
         env:
           SOURCE: ${{ inputs.source }}
           STORY_TEXT: ${{ inputs.story_text }}
           TOPIC: ${{ inputs.topic }}
+          BACKGROUND: ${{ inputs.background }}
+          LAYOUT: ${{ inputs.layout }}
+          VOICE: ${{ inputs.voice }}
+          CAPTIONS: ${{ inputs.captions }}
+          RATE: ${{ inputs.rate }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          python cloud_video/generate.py --source "$SOURCE" --text "$STORY_TEXT" --topic "$TOPIC"
-      - name: Upload finished MP4
+          python cloud_video/generate.py --source "$SOURCE" --text "$STORY_TEXT" --topic "$TOPIC" --background "$BACKGROUND" --layout "$LAYOUT" --voice "$VOICE" --captions "$CAPTIONS" --rate "$RATE"
+      - name: Upload MP4 and story
         uses: actions/upload-artifact@v4
-        if: success()
         with:
           name: story-video
           path: |
