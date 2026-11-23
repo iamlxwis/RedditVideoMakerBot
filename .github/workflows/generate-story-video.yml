@@ -55,6 +55,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg fonts-dejavu-core
           python -m pip install --disable-pip-version-check 'edge-tts==7.2.7'
+      - name: Validate renderer syntax and FFmpeg capabilities
+        run: |
+          python -m py_compile cloud_video/generate.py
+          ffmpeg -hide_banner -filters | grep -E ' ass ' || (echo 'FFmpeg ASS subtitle filter missing' && exit 1)
       - name: Render story video
         env:
           SOURCE: ${{ inputs.source }}
