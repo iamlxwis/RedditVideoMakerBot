@@ -1,93 +1,158 @@
 #!/usr/bin/env python3
-"""Standalone Android-friendly short video generator; no Reddit credentials required."""
+"""GitHub Actions video renderer. Original Reddit bot remains separate."""
 import argparse
+import asyncio
 import json
 import os
 import random
+import re
 import subprocess
-import textwrap
 from pathlib import Path
 from urllib.request import Request, urlopen
-
-from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFont
+import edge_tts
 
 OUT = Path("generated")
-W, H = 720, 1280
+OUT.mkdir(exist_ok=True)
+VOICES = {"guy": "en-US-GuyNeural", "jenny": "en-US-JennyNeural",
+          "ryan": "en-GB-RyanNeural", "sonia": "en-GB-SoniaNeural"}
 
-def story_from_ai(topic):
-    key = os.environ.get("GEMINI_API_KEY", "")
+def run(args):
+    subprocess.run(args, check=True)
+
+def probe(path):
+    return float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries",
+        "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)], text=True).strip())
+
+def ai_story(topic):
+    key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        return None
+        raise ValueError("AI mode requires the GEMINI_API_KEY Actions secret")
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-    payload = {"contents": [{"parts": [{"text": "Write an original fictional first-person internet confession story, 130-190 words, family-friendly, with a gripping hook and satisfying ending. No markdown. Topic: " + topic}]}]}
-    request = Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": key})
-    with urlopen(request, timeout=90) as response:
-        data = json.load(response)
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    data = {"contents": [{"parts": [{"text": "Write an original, fictional, first-person, family-friendly dramatic internet story in 140-180 words, with a hook and satisfying ending. Plain text only. Topic: " + topic}]}]}
+    req = Request(url, data=json.dumps(data).encode(), headers={"Content-Type": "application/json", "x-goog-api-key": key})
+    with urlopen(req, timeout=90) as response:
+        return json.load(response)["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-def sample_story():
-    return ("I thought my neighbor was stealing my packages. Every Friday, a delivery would disappear from my porch, "
-            "and every Friday, I spotted him walking past my door. I was ready to confront him until I checked the "
-            "delivery photos more closely. The packages were being left at the building next door. I walked over, "
-            "knocked, and met an elderly woman who had been collecting them so they would not get wet. "
-            "She had been trying to find the correct apartment number, but the labels were always smudged. "
-            "I apologized for the confusion and thanked her. Now I bring her groceries on Fridays, "
-            "and she texts me whenever a delivery arrives. The person I was suspicious of turned out "
-            "to be the kindest neighbor on the block.")
+def sample():
+    return ("I thought my neighbor was stealing my packages. Every Friday, a delivery disappeared from my porch. "
+            "I finally checked the delivery pictures and realized the packages were being left at the wrong building. "
+            "An elderly neighbor had been keeping them dry and trying to find the owner. I apologized and thanked her. "
+            "Now I help carry her groceries, and she sends me a message whenever another package arrives.")
 
-def font(size):
-    for path in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"):
-        if Path(path).exists():
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+async def narrate(story, voice, rate):
+    audio = OUT / "narration.mp3"
+    events = []
+    comm = edge_tts.Communicate(story, VOICES[voice], rate=f"{rate:+d}%")
+    with audio.open("wb") as f:
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                events.append((chunk["offset"] / 10_000_000, chunk["duration"] / 10_000_000, chunk["text"]))
+    if not audio.stat().st_size:
+        raise RuntimeError("TTS service returned empty audio")
+    return events
 
-def frames(story):
-    words = story.split()
-    chunks = [" ".join(words[i:i + 13]) for i in range(0, len(words), 13)]
-    folder = OUT / "frames"
-    folder.mkdir(parents=True, exist_ok=True)
-    for idx, chunk in enumerate(chunks):
-        image = Image.new("RGB", (W, H), (13, 18, 31))
-        d = ImageDraw.Draw(image)
-        d.rounded_rectangle((35, 370, 685, 880), radius=35, fill=(31, 41, 59))
-        d.text((75, 410), "STORY TIME", font=font(30), fill=(96, 165, 250))
-        lines = textwrap.wrap(chunk, width=20)
-        y = 505 - (len(lines) - 3) * 26
-        for line in lines:
-            d.text((75, y), line, font=font(45), fill="white")
-            y += 65
-        d.rectangle((35, 925, 35 + int(650 * (idx + 1) / len(chunks)), 935), fill=(96, 165, 250))
-        image.save(folder / f"{idx:04d}.png")
-    return len(chunks)
+def ass_time(t):
+    t = max(0, t)
+    return f"{int(t//3600)}:{int(t//60)%60:02d}:{t%60:05.2f}"
+
+def ass_escape(s):
+    return s.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}").replace("\n", " ")
+
+def subtitles(events, duration, style):
+    path = OUT / "captions.ass"
+    header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 720
+PlayResY: 1280
+WrapStyle: 2
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,56,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,2,2,55,55,270,1
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    lines = [header]
+    if style == "none":
+        path.write_text(header)
+        return path
+    if not events:
+        raise RuntimeError("TTS returned no word timing metadata; cannot synchronize captions")
+    for i, (start, dur, word) in enumerate(events):
+        lo = (i // 4) * 4
+        group = events[lo:lo+4]
+        end = min(duration, events[i+1][0] if i+1 < len(events) else start + max(dur, 0.35))
+        if end <= start:
+            end = start + 0.1
+        tokens = []
+        for j, (_, _, txt) in enumerate(group):
+            val = ass_escape(txt.strip())
+            if style == "highlight" and lo + j == i:
+                val = r"{\c&H00FFFF&}" + val + r"{\c&HFFFFFF&}"
+            tokens.append(val)
+        caption = " ".join(tokens)
+        lines.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Default,,0,0,0,,{caption}\n")
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+def choose_background(selection):
+    folder = Path("assets/backgrounds/video")
+    candidates = sorted(p for p in folder.glob("*") if p.suffix.lower() in (".mp4", ".mov", ".mkv", ".webm"))
+    # Only use user-supplied clips, not upstream YouTube URLs with unverified licenses.
+    if selection != "random":
+        candidates = [p for p in candidates if selection in p.stem.lower()]
+    if not candidates:
+        print("No user-provided licensed gameplay footage found; rendering animated demo background.", flush=True)
+        return None
+    picked = random.choice(candidates)
+    print(f"Selected gameplay: {picked}", flush=True)
+    return picked
+
+def render(background, duration, captions, layout):
+    output = OUT / "story-video.mp4"
+    # Animated demo background is deliberately NOT represented as Minecraft footage.
+    if background:
+        inputs = ["-stream_loop", "-1", "-i", str(background), "-i", str(OUT / "narration.mp3")]
+        base = "[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1"
+    else:
+        inputs = ["-f", "lavfi", "-i", f"testsrc2=size=720x1280:rate=24:duration={duration+0.5:.2f}", "-i", str(OUT / "narration.mp3")]
+        base = "[0:v]format=yuv420p"
+    # Captions are placed over gameplay; split layout reserves upper space for story text.
+    if layout == "split":
+        base += ",drawbox=x=0:y=0:w=720:h=610:color=0x111827@0.9:t=fill"
+    base += ",ass=generated/captions.ass[v]"
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inputs,
+         "-filter_complex", base, "-map", "[v]", "-map", "1:a:0", "-t", f"{duration:.3f}",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-r", "24",
+         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+         "-movflags", "+faststart", str(output)])
+    print(f"Created {output} ({output.stat().st_size} bytes)", flush=True)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["sample", "manual", "ai", "reddit"], default="sample")
-    parser.add_argument("--text", default="")
-    parser.add_argument("--topic", default="An unexpected act of kindness")
-    args = parser.parse_args()
-    OUT.mkdir(exist_ok=True)
+    p = argparse.ArgumentParser()
+    p.add_argument("--source", choices=["sample", "manual", "ai", "reddit"], default="sample")
+    p.add_argument("--text", default="")
+    p.add_argument("--topic", default="An unexpected act of kindness")
+    p.add_argument("--background", choices=["random", "minecraft", "minecraft-2", "gta"], default="random")
+    p.add_argument("--layout", choices=["full", "split"], default="full")
+    p.add_argument("--voice", choices=list(VOICES), default="guy")
+    p.add_argument("--captions", choices=["highlight", "normal", "none"], default="highlight")
+    p.add_argument("--rate", type=int, default=0)
+    args = p.parse_args()
+    if not -40 <= args.rate <= 40:
+        p.error("--rate must be between -40 and 40")
     if args.source == "reddit":
-        raise SystemExit("Reddit API access is not configured. Use manual text with permission, sample, or AI.")
-    if args.source == "manual":
-        story = args.text.strip()
-        if not story:
-            raise SystemExit("Manual source requires --text")
-    elif args.source == "ai":
-        story = story_from_ai(args.topic)
-        if not story:
-            raise SystemExit("AI source requires GEMINI_API_KEY GitHub Actions secret. Sample mode works without a key.")
-    else:
-        story = sample_story()
+        p.error("Reddit API integration requires approved access and is not enabled")
+    story = (args.text.strip() if args.source == "manual" else
+             ai_story(args.topic) if args.source == "ai" else sample())
+    if not story:
+        p.error("Story is empty")
     (OUT / "story.txt").write_text(story, encoding="utf-8")
-    print("Generating narration...", flush=True)
-    gTTS(text=story, lang="en").save(str(OUT / "narration.mp3"))
-    duration = float(subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(OUT / "narration.mp3")], text=True).strip())
-    count = frames(story)
-    fps = count / max(duration, 1)
-    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", str(fps), "-i", str(OUT / "frames/%04d.png"), "-i", str(OUT / "narration.mp3"), "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", str(OUT / "story-video.mp4")], check=True)
-    print("Created generated/story-video.mp4", flush=True)
+    events = asyncio.run(narrate(story, args.voice, args.rate))
+    duration = probe(OUT / "narration.mp3")
+    subtitles(events, duration, args.captions)
+    render(choose_background(args.background), duration, args.captions, args.layout)
 
 if __name__ == "__main__":
     main()
